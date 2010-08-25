@@ -1,0 +1,227 @@
+package RFID::Biblio::Reader::3M810;
+
+use base 'RFID::Biblio';
+use RFID::Biblio;
+
+use Data::Dump qw(dump);
+use Carp qw(confess);
+use Time::HiRes;
+use Digest::CRC;
+
+sub serial_settings {{
+	device    => "/dev/ttyUSB1", # FIXME comment out before shipping
+	baudrate  => "19200",
+	databits  => "8",
+	parity	  => "none",
+	stopbits  => "1",
+	handshake => "none",
+}}
+
+my $port;
+sub init {
+	my $self = shift;
+	$port = $self->port;
+
+	# drain on startup
+	my ( $count, $str ) = $port->read(3);
+	my $data = $port->read( ord(substr($str,2,1)) );
+	warn "drain ",as_hex( $str, $data ),"\n";
+
+	setup();
+
+}
+
+sub checksum {
+	my $bytes = shift;
+	my $crc = Digest::CRC->new(
+		# midified CCITT to xor with 0xffff instead of 0x0000
+		width => 16, init => 0xffff, xorout => 0xffff, refout => 0, poly => 0x1021, refin => 0,
+	) or die $!;
+	$crc->add( $bytes );
+	pack('n', $crc->digest);
+}
+
+sub wait_device {
+	Time::HiRes::sleep 0.015;
+}
+
+sub cmd {
+	my ( $hex, $description, $coderef ) = @_;
+	my $bytes = hex2bytes($hex);
+	if ( substr($bytes,0,1) !~ /(\xD5|\xD6)/ ) {
+		my $len = pack( 'n', length( $bytes ) + 2 );
+		$bytes = $len . $bytes;
+		my $checksum = checksum($bytes);
+		$bytes = "\xD6" . $bytes . $checksum;
+	}
+
+	warn ">> ", as_hex( $bytes ), "\t\t[$description]\n";
+	$port->write( $bytes );
+
+	wait_device;
+
+	my $r_len = $port->read(3);
+
+	while ( length($r_len) < 3 ) {
+		wait_device;
+		$r_len = $port->read( 3 - length($r_len) );
+	}
+
+	wait_device;
+
+	my $len = ord( substr($r_len,2,1) );
+	$data = $port->read( $len );
+
+	while ( length($data) < $len ) {
+		warn "# short read ", length($data), " < $len\n";
+		wait_device;
+		$data .= $port->read( $len - length($data) );
+	}
+
+	warn "<< ", as_hex($r_len,$data),
+		' | ',
+		substr($data,-2,2) eq checksum(substr($r_len,1).substr($data,0,-2)) ? 'OK' : 'ERROR',
+		" $len bytes\n";
+
+
+	$coderef->( $data ) if $coderef;
+
+}
+
+sub assert {
+	my ( $got, $expected ) = @_;
+	$expected = hex2bytes($expected);
+
+	my $len = length($got);
+	$len = length($expected) if length $expected < $len;
+
+	confess "got ", as_hex($got), " expected ", as_hex($expected)
+	unless substr($got,0,$len) eq substr($expected,0,$len);
+
+	return substr($got,$len);
+}
+
+sub setup {
+
+cmd(
+'D5 00  05   04 00 11   8C66', 'hw version', sub {
+	my $data = shift;
+	my $rest = assert $data => '04 00 11';
+	my $hw_ver = join('.', unpack('CCCC', $rest));
+	warn "# 3M 810 hardware version $hw_ver\n";
+});
+
+cmd(
+'13  04 01 00 02 00 03 00 04 00','FIXME: stats? rf-on?', sub { assert(shift,
+'13  00 02 01 01 03 02 02 03 00'
+)});
+}
+
+=head2 inventory
+
+  my @tags = inventory;
+
+=cut
+
+sub inventory {
+
+	my @tags;
+
+cmd( 'FE  00 05', 'scan for tags', sub {
+	my $data = shift;
+	my $rest = assert $data => 'FE 00 00 05';
+	my $nr = ord( substr( $rest, 0, 1 ) );
+
+	if ( ! $nr ) {
+		warn "# no tags in range\n";
+	} else {
+		my $tags = substr( $rest, 1 );
+		my $tl = length( $tags );
+		die "wrong length $tl for $nr tags: ",dump( $tags ) if $tl =! $nr * 8;
+
+		foreach ( 0 .. $nr - 1 ) {
+			push @tags, hex_tag substr($tags, $_ * 8, 8);
+		}
+	}
+
+});
+
+	warn "# tags ",dump @tags;
+	return @tags;
+}
+
+
+# 3M defaults: 8,4
+# cards 16, stickers: 8
+my $max_rfid_block = 8;
+my $blocks = 8;
+
+sub _matched {
+	my ( $data, $hex ) = @_;
+	my $b = hex2bytes $hex;
+	my $l = length($b);
+	if ( substr($data,0,$l) eq $b ) {
+		warn "_matched $hex [$l] in ",as_hex($data);
+		return substr($data,$l);
+	}
+}
+
+sub read_blocks {
+	my $tag = shift || confess "no tag?";
+	$tag = shift if ref($tag);
+
+	my $tag_blocks;
+	my $start = 0;
+	cmd(
+		 sprintf( "02 $tag %02x %02x", $start, $blocks ) => "read_blocks $tag $start/$blocks", sub {
+			my $data = shift;
+			if ( my $rest = _matched $data => '02 00' ) {
+
+				my $tag = hex_tag substr($rest,0,8);
+				my $blocks = ord(substr($rest,8,1));
+				warn "# response from $tag $blocks blocks ",as_hex substr($rest,9);
+				foreach ( 1 .. $blocks ) {
+					my $pos = ( $_ - 1 ) * 6 + 9;
+					my $nr = unpack('v', substr($rest,$pos,2));
+					my $payload = substr($rest,$pos+2,4);
+					warn "## pos $pos block $nr ",as_hex($payload), $/;
+					$tag_blocks->{$tag}->[$nr] = $payload;
+				}
+			} elsif ( my $rest = _matched $data => 'FE 00 00 05 01' ) {
+				warn "FIXME ready? ",as_hex $test;
+			} elsif ( my $rest = _matched $data => '02 06' ) {
+				warn "ERROR ",as_hex($rest);
+			} else {
+				warn "FIXME unsuported ",as_hex($rest);
+			}
+	});
+
+	warn "# tag_blocks ",dump($tag_blocks);
+	return $tag_blocks;
+}
+
+sub read_afi {
+	my $tag = shift;
+	$tag = shift if ref $tag;
+
+	cmd(
+		"0A $tag", "read_afi security $tag", sub {
+		my $data = shift;
+
+		if ( my $rest = _matched $data => '0A 00' ) {
+
+			my $tag = hex_tag substr($rest,0,8);
+			my $afi = substr($rest,8,1);
+
+			warn "# SECURITY ", hex_tag($tag), " AFI: ", as_hex($afi);
+
+			return $afi;
+		} elsif ( my $rest = _matched $data => '0A 06' ) {
+			warn "ERROR reading security from $tag ", as_hex($data);
+		} else {
+			warn "IGNORED ",as_hex($data);
+		}
+	});
+}
+
+1
